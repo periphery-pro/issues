@@ -3,7 +3,8 @@
 
 Each source issue becomes one new issue here. The original description and every
 comment are collapsed into the new issue body, preserving authorship and dates,
-with a link back to the original issue.
+with a link back to the original issue. A comment is then posted on the original
+saying where it moved.
 
 Requires the `gh` CLI, authenticated with read access to the source repo and
 write access to the target repo.
@@ -50,6 +51,11 @@ LABEL_MAP = {
 MAX_BODY_CHARS = 65536
 
 MARKER_RE = re.compile(r"<!-- migrated-from: (?P<repo>[^#\s]+)#(?P<number>\d+) -->")
+
+
+def migrated_to_marker(target_repo):
+    """Marks the notice left on the original issue, so it's only posted once."""
+    return f"<!-- migrated-to: {target_repo} -->"
 
 # Fenced code blocks and inline code spans, so rewrites can skip over them.
 CODE_SEGMENT_RE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`\n]*`)", re.DOTALL)
@@ -186,14 +192,14 @@ def fetch_comments(source_repo, number):
 
 
 def already_migrated(target_repo, source_repo):
-    """Return the source issue numbers that are already present in the target."""
+    """Map source issue number -> the target issue it was migrated to."""
     migrated = {}
     for issue in paginate(f"repos/{target_repo}/issues?state=all"):
         if issue.get("pull_request"):
             continue
         match = MARKER_RE.search(issue.get("body") or "")
         if match and match.group("repo") == source_repo:
-            migrated[int(match.group("number"))] = issue["html_url"]
+            migrated[int(match.group("number"))] = issue
     return migrated
 
 
@@ -237,11 +243,57 @@ def check_labels(issues, target_repo, ignore_unmapped):
 
 def create_issue(target_repo, title, body, labels):
     payload = {"title": title, "body": body, "labels": sorted(labels)}
-    created = gh_json(
+    return gh_json(
         ["api", f"repos/{target_repo}/issues", "--method", "POST", "--input", "-"],
         stdin=json.dumps(payload),
     )
-    return created["html_url"]
+
+
+def render_source_comment(target_repo, new_issue):
+    return (
+        f"This issue has been migrated to [{target_repo}#{new_issue['number']}]"
+        f"({new_issue['html_url']}) and is now tracked there.\n\n"
+        f"{migrated_to_marker(target_repo)}\n"
+    )
+
+
+def post_source_comment(source_repo, number, body):
+    gh_json(
+        ["api", f"repos/{source_repo}/issues/{number}/comments", "--method", "POST", "--input", "-"],
+        stdin=json.dumps({"body": body}),
+    )
+
+
+def has_source_comment(comments, target_repo):
+    marker = migrated_to_marker(target_repo)
+    return any(marker in (comment.get("body") or "") for comment in comments)
+
+
+def backfill_source_comments(args, issues, migrated):
+    """Post the notice on issues migrated by an earlier run that never got one.
+
+    Creating the issue and commenting on the original are two calls, so a run
+    interrupted between them leaves the original without a notice. Since the
+    issue itself is then skipped, only this pass can repair it.
+    """
+    for issue in issues:
+        target_issue = migrated.get(issue["number"])
+        if not target_issue:
+            continue
+        if has_source_comment(fetch_comments(args.source, issue["number"]), args.target):
+            continue
+
+        if args.dry_run:
+            print(f"would comment on {issue['html_url']} (migrated earlier, notice missing)")
+            continue
+
+        try:
+            post_source_comment(
+                args.source, issue["number"], render_source_comment(args.target, target_issue)
+            )
+            print(f"commented on {issue['html_url']} (migrated earlier, notice missing)")
+        except GhError as error:
+            print(f"warning: could not comment on {issue['html_url']}: {error}", file=sys.stderr)
 
 
 def parse_args(argv):
@@ -258,7 +310,7 @@ def parse_args(argv):
     parser.add_argument("--limit", type=int, help="migrate at most this many issues")
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="render the new issues without creating anything",
+        help="render the new issues, creating nothing and commenting nowhere",
     )
     parser.add_argument(
         "--out-dir", type=Path, default=Path(".migration-preview"),
@@ -267,6 +319,10 @@ def parse_args(argv):
     parser.add_argument(
         "--ignore-unmapped-labels", action="store_true",
         help="drop source labels missing from LABEL_MAP instead of aborting",
+    )
+    parser.add_argument(
+        "--no-source-comment", action="store_true",
+        help="don't comment on the original issue to say where it moved",
     )
     parser.add_argument(
         "--raw", action="store_true",
@@ -298,8 +354,6 @@ def main(argv=None):
         pending = pending[: args.limit]
 
     print(f"{len(pending)} issue(s) to migrate.\n")
-    if not pending:
-        return 0
 
     if not check_labels(pending, args.target, args.ignore_unmapped_labels):
         return 1
@@ -324,20 +378,38 @@ def main(argv=None):
             preview = args.out_dir / f"{number}.md"
             preview.write_text(f"# {issue['title']}\n\n{body}")
             print(f"{prefix}\n  {summary} -> {preview}")
+            if not args.no_source_comment:
+                print(f"  would comment on {issue['html_url']}")
             continue
 
-        url = create_issue(args.target, issue["title"], body, labels)
-        mapping[issue["html_url"]] = url
-        print(f"{prefix}\n  {summary}\n  created {url}")
+        created = create_issue(args.target, issue["title"], body, labels)
+        mapping[issue["html_url"]] = created["html_url"]
+        print(f"{prefix}\n  {summary}\n  created {created['html_url']}")
+
+        if not args.no_source_comment:
+            try:
+                post_source_comment(args.source, number, render_source_comment(args.target, created))
+                print(f"  commented on {issue['html_url']}")
+            except GhError as error:
+                # The new issue exists, so don't abort the run; a later run
+                # back-fills the notice.
+                print(f"  warning: could not comment on {issue['html_url']}: {error}", file=sys.stderr)
+
         if index < len(pending) and args.delay:
             time.sleep(args.delay)
+
+    if not args.no_source_comment:
+        backfill_source_comments(args, issues, migrated)
 
     if args.map_file and mapping:
         args.map_file.write_text(json.dumps(mapping, indent=2) + "\n")
         print(f"\nWrote mapping for {len(mapping)} issue(s) to {args.map_file}")
 
     if args.dry_run:
-        print(f"\nDry run: nothing was created. Rendered bodies are in {args.out_dir}/")
+        print(
+            f"\nDry run: no issues created and no comments posted. "
+            f"Rendered bodies are in {args.out_dir}/"
+        )
 
     return 0
 
