@@ -38,6 +38,10 @@ from pathlib import Path
 DEFAULT_SOURCE = "peripheryapp/periphery"
 DEFAULT_TARGET = "periphery-pro/issues"
 
+# Explains the move to a commercial model; linked from the notice left on each
+# original issue.
+NEW_CHAPTER_URL = "https://periphery.pro/a-new-chapter"
+
 # Source label -> label in this repo. Any source label missing from this table
 # aborts the migration, so new upstream labels get a deliberate decision rather
 # than being silently dropped.
@@ -253,6 +257,9 @@ def render_source_comment(target_repo, new_issue):
     return (
         f"This issue has been migrated to [{target_repo}#{new_issue['number']}]"
         f"({new_issue['html_url']}) and is now tracked there.\n\n"
+        "Periphery is moving to a commercial model, and issues are now handled in that "
+        f"repository. You can read about what's changing, and what it means for existing "
+        f"users, in [A New Chapter]({NEW_CHAPTER_URL}).\n\n"
         f"{migrated_to_marker(target_repo)}\n"
     )
 
