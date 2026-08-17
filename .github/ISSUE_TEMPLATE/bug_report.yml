@@ -1,0 +1,34 @@
+name: Bug report
+description: Create a report to help us improve
+labels: [triage]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >-
+        If you are reporting an incorrect result, please provide a sample Xcode
+        or Swift package project that reproduces the issue.
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Copy the output from running:
+
+        ```
+        periphery version
+        swift -version
+        xcodebuild -version
+        ```
+    validations:
+      required: true
